@@ -1,0 +1,77 @@
+name: Weekly database release
+
+on:
+  schedule:
+    - cron: "17 7 * * 1"   # Mondays 07:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install DuckDB
+        run: pip install duckdb==1.4.1
+
+      - name: Run script tests
+        run: python3 scripts/test_build_product_database.py
+
+      - name: Download the Open Food Facts CSV export
+        run: |
+          curl --fail --location --retry 3 --retry-delay 30 --silent --show-error \
+            -o products.csv.gz https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz
+          ls -l products.csv.gz
+
+      - name: Build the US and Canada database
+        run: |
+          VERSION=$(date -u +%Y%m%d)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          python3 scripts/build_product_database.py --csv products.csv.gz \
+            --output AisleKept-products.sqlite --version "$VERSION"
+          rm products.csv.gz
+
+      - name: Sanity check the database
+        run: |
+          COUNT=$(python3 -c "import sqlite3; print(sqlite3.connect('AisleKept-products.sqlite').execute('SELECT count(*) FROM products').fetchone()[0])")
+          echo "Products: $COUNT"
+          # A sudden drop means a broken export; keep last week's release instead.
+          test "$COUNT" -ge 500000
+
+      - name: Compress and write the manifest
+        run: |
+          python3 scripts/package_release.py --database AisleKept-products.sqlite \
+            --version "$VERSION" --output-directory release \
+            --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/db-$VERSION"
+          cp DATA-LICENSE.md release/DATA-LICENSE.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="db-$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --title "Product database $VERSION" \
+              --notes "US and Canada products derived from Open Food Facts. Licensed under the ODbL 1.0; see DATA-LICENSE.md." --latest
+          fi
+
+      - name: Keep only the newest 8 releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
+            while read -r old_tag; do gh release delete "$old_tag" --yes --cleanup-tag; done

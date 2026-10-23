@@ -1,0 +1,4 @@
+*.sqlite
+*.csv.gz
+release/
+__pycache__/
