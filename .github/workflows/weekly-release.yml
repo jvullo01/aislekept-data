@@ -68,10 +68,3 @@ jobs:
             gh release create "$TAG" release/* --title "Product database $VERSION" \
               --notes "US and Canada products derived from Open Food Facts. Licensed under the ODbL 1.0; see DATA-LICENSE.md." --latest
           fi
-
-      - name: Keep only the newest 8 releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
-            while read -r old_tag; do gh release delete "$old_tag" --yes --cleanup-tag; done

@@ -31,7 +31,7 @@ and SHA-256 and size of both the compressed and the decompressed file.
 1. Downloads the official Open Food Facts CSV export.
 2. `scripts/build_product_database.py` keeps US and Canada products with a name, a valid barcode and energy data.
 3. `scripts/package_release.py` compresses the database and writes `manifest.json`.
-4. Publishes a release tagged `db-YYYYMMDD` and keeps the newest 8.
+4. Publishes a release tagged `db-YYYYMMDD`. Every release is kept.
 
 If the build fails or the product count looks wrong, no release is made and the previous one stays current.
 
