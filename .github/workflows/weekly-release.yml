@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install DuckDB
-        run: pip install duckdb==1.4.1
+        run: pip install duckdb==1.4.5
 
       - name: Run script tests
         run: python3 scripts/test_build_product_database.py
