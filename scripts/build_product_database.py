@@ -17,7 +17,11 @@ import json
 import os
 import sqlite3
 
+import sys
+
 import duckdb
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_COUNTRY_TAGS = ("en:united-states", "en:canada")
 INSERT_BATCH_SIZE = 50_000
@@ -37,10 +41,50 @@ SCHEMA_STATEMENTS = (
         additive_codes TEXT,           -- comma separated, e.g. "e330,e322i"
         allergen_codes TEXT,           -- comma separated, e.g. "milk,soybeans"
         processing_group INTEGER,      -- NOVA group 1-4, when known
-        image_url TEXT
+        image_url TEXT,
+        category_id INTEGER,           -- categories.id of the Open Food Facts main category (schema 2)
+        unscored_kind TEXT,            -- alcohol, supplement, infant_formula, pet_food or cleaning (schema 2)
+        data_flags INTEGER NOT NULL DEFAULT 0, -- DataFlag bits: what the source record contains (schema 2)
+        ingredients_text TEXT          -- only for unscored or nutrition-less products, to keep the file small
     ) WITHOUT ROWID""",
     "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID",
+    """CREATE TABLE categories (
+        id INTEGER PRIMARY KEY,
+        tag TEXT NOT NULL UNIQUE,      -- e.g. "en:greek-yogurts"
+        name TEXT NOT NULL,            -- English name, e.g. "Greek yogurts"
+        product_count INTEGER NOT NULL
+    )""",
+    """CREATE TABLE category_top_picks (
+        category_id INTEGER NOT NULL,
+        rank INTEGER NOT NULL,         -- 1 is the best pick in the category
+        barcode INTEGER NOT NULL,
+        pick_score INTEGER NOT NULL,   -- approximate 0-100 score; the app re-scores with its own calculator
+        PRIMARY KEY (category_id, rank)
+    ) WITHOUT ROWID""",
 )
+SCHEMA_VERSION = 2
+INDEX_STATEMENTS = ("CREATE INDEX products_by_category ON products (category_id)",)
+
+
+from pick_score import TOP_PICKS_PER_CATEGORY, TopPicks, approximate_score  # noqa: E402
+
+# Categories whose products are kept but never scored (Yuka leaves them out entirely).
+UNSCORED_CATEGORY_PATTERNS = (
+    ("alcohol", ("en:alcoholic-beverages",)),
+    ("infant_formula", ("en:infant-formula", "en:baby-milks", "en:infant-milks")),
+    ("supplement", ("en:dietary-supplements",)),
+    ("pet_food", ("en:pet-food", "en:pet-foods", "en:dog-food", "en:cat-food")),
+    ("cleaning", ("en:cleaning-products", "en:detergents", "en:household-products")),
+)
+MAXIMUM_INGREDIENTS_LENGTH = 2_000
+
+
+class DataFlag:
+    """Bits of products.data_flags. The app derives the 'Partial data' label from them."""
+    HAS_ENERGY = 1
+    HAS_CORE_NUTRIENTS = 2   # at least 4 of fat, saturated fat, sugars, salt, fiber, protein
+    HAS_INGREDIENTS = 4
+    HAS_IMAGE = 8
 
 
 def parse_arguments():
@@ -73,7 +117,8 @@ def selection_query(csv_path, country_tags):
             TRY_CAST(code AS BIGINT) AS barcode,
             trim(product_name) AS name,
             nullif(trim(split_part(brands, ',', 1)), '') AS brand,
-            TRY_CAST("energy-kcal_100g" AS DOUBLE) AS energy_kcal,
+            CASE WHEN TRY_CAST("energy-kcal_100g" AS DOUBLE) BETWEEN 0 AND 1000
+                 THEN TRY_CAST("energy-kcal_100g" AS DOUBLE) END AS energy_kcal,
             {nutrient_columns["fat"]} AS fat,
             {nutrient_columns["saturated_fat"]} AS saturated_fat,
             {nutrient_columns["sugars"]} AS sugars,
@@ -83,15 +128,27 @@ def selection_query(csv_path, country_tags):
             nullif(replace(additives_tags, 'en:', ''), '') AS additive_codes,
             nullif(replace(allergens, 'en:', ''), '') AS allergen_codes,
             TRY_CAST(nova_group AS INTEGER) AS processing_group,
-            nullif(image_small_url, '') AS image_url
+            nullif(image_small_url, '') AS image_url,
+            nullif(trim(main_category), '') AS category_tag,
+            nullif(trim(main_category_en), '') AS category_name,
+            {unscored_kind_sql()} AS unscored_kind,
+            nullif(trim(ingredients_text), '') AS ingredients_text
         FROM read_csv('{csv_path}', delim='\t', quote='', header=true, all_varchar=true,
                       ignore_errors=true, null_padding=true, max_line_size=20000000)
         WHERE ({country_filter})
           AND regexp_matches(code, '^[0-9]{{8,14}}$')
           AND nullif(trim(product_name), '') IS NOT NULL
-          AND TRY_CAST("energy-kcal_100g" AS DOUBLE) BETWEEN 0 AND 1000
         QUALIFY row_number() OVER (PARTITION BY TRY_CAST(code AS BIGINT) ORDER BY last_modified_t DESC) = 1
     """
+
+
+def unscored_kind_sql():
+    """SQL CASE that names the unscored category of a row from its categories_tags, or NULL."""
+    branches = []
+    for kind, tags in UNSCORED_CATEGORY_PATTERNS:
+        condition = " OR ".join(f"categories_tags LIKE '%{tag}%'" for tag in tags)
+        branches.append(f"WHEN {condition} THEN '{kind}'")
+    return "CASE " + " ".join(branches) + " END"
 
 
 SHORT_CODE_LIMIT = 10_000_000  # numeric values below this have fewer than 8 significant digits
@@ -156,26 +213,96 @@ def is_plausible_row(row):
     return is_plausible_barcode(row[0], core_nutrient_count)
 
 
+SOURCE_COLUMN_COUNT = 14  # barcode .. image_url, the columns schema 1 already had
+
+
+def data_flags_of(row):
+    """DataFlag bits for a selected row (see `selection_query` for the column order)."""
+    core_nutrient_count = sum(1 for value in row[CORE_NUTRIENT_COLUMNS] if value is not None)
+    flags = 0
+    if row[3] is not None:
+        flags |= DataFlag.HAS_ENERGY
+    if core_nutrient_count >= MINIMUM_CORE_NUTRIENTS_FOR_SHORT_CODE:
+        flags |= DataFlag.HAS_CORE_NUTRIENTS
+    if row[17] is not None:
+        flags |= DataFlag.HAS_INGREDIENTS
+    if row[13] is not None:
+        flags |= DataFlag.HAS_IMAGE
+    return flags
+
+
+def stored_ingredients(row, flags):
+    """Ingredients are kept only where the app shows them instead of a score, so the file stays small."""
+    is_unscored = row[16] is not None
+    has_nutrition = flags & DataFlag.HAS_CORE_NUTRIENTS and flags & DataFlag.HAS_ENERGY
+    if row[17] is None or (not is_unscored and has_nutrition):
+        return None
+    return row[17][:MAXIMUM_INGREDIENTS_LENGTH]
+
+
+class CategoryIndex:
+    """Gives each main category a small integer id and counts its products."""
+
+    def __init__(self):
+        self.ids_by_tag = {}
+        self.names_by_id = {}
+        self.counts_by_id = {}
+
+    def id_for(self, tag, name):
+        if tag is None:
+            return None
+        category_id = self.ids_by_tag.get(tag)
+        if category_id is None:
+            category_id = len(self.ids_by_tag) + 1
+            self.ids_by_tag[tag] = category_id
+            self.names_by_id[category_id] = name or tag.split(":", 1)[-1].replace("-", " ").capitalize()
+            self.counts_by_id[category_id] = 0
+        self.counts_by_id[category_id] += 1
+        return category_id
+
+    def rows(self):
+        return [(category_id, tag, self.names_by_id[category_id], self.counts_by_id[category_id])
+                for tag, category_id in self.ids_by_tag.items()]
+
+
+def stored_row(row, categories, top_picks):
+    """Turns a selected row into a products row and feeds the top-picks ranking."""
+    flags = data_flags_of(row)
+    category_id = categories.id_for(row[14], row[15])
+    unscored_kind = row[16]
+    is_rankable = unscored_kind is None and flags & DataFlag.HAS_ENERGY and flags & DataFlag.HAS_CORE_NUTRIENTS
+    if category_id is not None and is_rankable:
+        top_picks.offer(category_id, row[0], approximate_score(row))
+    return row[:SOURCE_COLUMN_COUNT] + (category_id, unscored_kind, flags, stored_ingredients(row, flags))
+
+
 def write_database(rows_cursor, output_path, version, source_description):
     if os.path.exists(output_path):
         os.remove(output_path)
     database = sqlite3.connect(output_path)
     for statement in SCHEMA_STATEMENTS:
         database.execute(statement)
+    categories = CategoryIndex()
+    top_picks = TopPicks(TOP_PICKS_PER_CATEGORY)
     product_count = 0
     while True:
         batch = rows_cursor.fetchmany(INSERT_BATCH_SIZE)
         if not batch:
             break
-        batch = [row for row in batch if is_plausible_row(row)]
-        database.executemany("INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+        batch = [stored_row(row, categories, top_picks) for row in batch if is_plausible_row(row)]
+        database.executemany("INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
         product_count += len(batch)
+    database.executemany("INSERT INTO categories VALUES (?, ?, ?, ?)", categories.rows())
+    database.executemany("INSERT INTO category_top_picks VALUES (?, ?, ?, ?)", top_picks.rows())
+    for statement in INDEX_STATEMENTS:
+        database.execute(statement)
     metadata = {
         "version": version,
         "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "source": source_description,
         "license": "Open Database License (ODbL) 1.0, https://opendatacommons.org/licenses/odbl/1-0/",
         "product_count": str(product_count),
+        "schema_version": str(SCHEMA_VERSION),
     }
     database.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
     database.commit()

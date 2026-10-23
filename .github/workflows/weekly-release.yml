@@ -27,7 +27,9 @@ jobs:
         run: pip install duckdb==1.4.5
 
       - name: Run script tests
-        run: python3 scripts/test_build_product_database.py
+        run: |
+          python3 scripts/test_build_product_database.py
+          python3 scripts/test_brand_coverage.py
 
       - name: Download the Open Food Facts CSV export
         run: |
@@ -36,8 +38,12 @@ jobs:
           ls -l products.csv.gz
 
       - name: Build the US and Canada database
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(date -u +%Y%m%d)
+          # A second run on the same day gets its own tag, so an earlier release is never overwritten.
+          if gh release view "db-$VERSION" >/dev/null 2>&1; then VERSION=$(date -u +%Y%m%d-%H%M); fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           python3 scripts/build_product_database.py --csv products.csv.gz \
             --output AisleKept-products.sqlite --version "$VERSION"
@@ -57,14 +63,20 @@ jobs:
             --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/db-$VERSION"
           cp DATA-LICENSE.md release/DATA-LICENSE.md
 
+      - name: Count store-brand coverage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous-release
+          # The latest release before this one; the first release with counts has nothing to compare.
+          gh release download --pattern brand-coverage.json --dir previous-release || echo "No previous brand counts"
+          python3 scripts/brand_coverage.py --database AisleKept-products.sqlite \
+            --output release/brand-coverage.json --previous previous-release/brand-coverage.json
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="db-$VERSION"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/* --clobber
-          else
-            gh release create "$TAG" release/* --title "Product database $VERSION" \
-              --notes "US and Canada products derived from Open Food Facts. Licensed under the ODbL 1.0; see DATA-LICENSE.md." --latest
-          fi
+          gh release create "$TAG" release/* --title "Product database $VERSION" \
+            --notes "US and Canada products derived from Open Food Facts. Licensed under the ODbL 1.0; see DATA-LICENSE.md. Store-brand counts: brand-coverage.json." --latest

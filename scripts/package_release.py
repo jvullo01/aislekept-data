@@ -17,7 +17,7 @@ import os
 import sqlite3
 import zlib
 
-SCHEMA_VERSION = 1  # bump when the products/metadata tables change shape
+SCHEMA_VERSION = 2  # bump when the products/metadata tables change shape
 MINIMUM_APP_VERSION = "0.1.0"
 CHUNK_SIZE = 1 << 20
 LICENSE_TEXT = "Open Database License (ODbL) 1.0, https://opendatacommons.org/licenses/odbl/1-0/"
